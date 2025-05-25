@@ -4,96 +4,110 @@ import threading
 from threading import Lock
 from operator import itemgetter
 
-# Shared state
-api_url = 'https://api.hypixel.net/v2/skyblock/bazaar'
-api_response = None
-lock = Lock()
-data_ready = threading.Event()
+# ===== CONFIGURATION =====
+BAZAAR_URL = 'https://api.hypixel.net/v2/skyblock/bazaar'
+INVESTMENT = 10_000_000  # 10 million coin base investment
+MIN_MARGIN_PCT = 1.5     # 1.5% minimum profit margin
+MIN_PRICE = 100          # Minimum price per item to consider (exclusive)
+MIN_LIQUIDITY = 500000      # Minimum available items to consider
 
-def update_api():
-    global api_response
+# ===== SHARED STATE =====
+lock = Lock()
+api_data = None
+
+def fetch_bazaar():
+    global api_data
     while True:
         try:
-            response = requests.get(api_url, timeout=10)
-            response.raise_for_status()
-            with lock:
-                api_response = response.json()
-                if not data_ready.is_set():
-                    data_ready.set()
+            response = requests.get(BAZAAR_URL, timeout=15)
+            if response.status_code == 200:
+                with lock:
+                    api_data = response.json()
+                    
+                last_updated = api_data.get('lastUpdated', time.time()*1000) / 1000
+                delay = max(last_updated + 60 - time.time(), 5)
+            else:
+                delay = 30
                 
-            last_updated = api_response['lastUpdated'] / 1000
-            delay = max(last_updated + 60 - time.time(), 0)
             time.sleep(delay)
+            
         except Exception as e:
-            print(f"API Error: {str(e)[:100]}")
+            print(f"Connection error: {str(e)[:50]}")
             time.sleep(30)
 
-def analyze_profits():
+def analyze_markets():
     while True:
-        with lock:
-            if not api_response:
-                time.sleep(1)
-                continue
-                
-            profitable_items = []
-            for product_id, product in api_response['products'].items():
-                try:
-                    buy = product['buy_summary'][0]
-                    sell = product['sell_summary'][0]
-                    
-                    # Calculate core values
-                    buy_price = buy['pricePerUnit']
-                    sell_price = sell['pricePerUnit']
-                    buy_volume = buy['amount']
-                    sell_volume = sell['amount']
-                    
-                    # Skip negative margins
-                    if sell_price <= buy_price:
-                        continue
-                        
-                    # Calculate fill times for 1m worth
-                    buy_fill_time = 1_000_000 / (buy_price * buy_volume) if buy_volume > 0 else float('inf')
-                    sell_fill_time = 1_000_000 / (sell_price * sell_volume) if sell_volume > 0 else float('inf')
-                    
-                    # Use the limiting factor (worst case)
-                    limiter = max(buy_fill_time, sell_fill_time)
-                    if limiter == 0 or limiter == float('inf'):
-                        continue
-                        
-                    # Calculate hourly potential
-                    hourly_volume = 3600 / limiter
-                    gross_profit = (sell_price - buy_price) * hourly_volume
-                    net_profit = gross_profit * 0.75  # Deduct 25%
-                    
-                    profitable_items.append({
-                        'item': product_id,
-                        'margin': sell_price - buy_price,
-                        'hourly_profit': net_profit,
-                        'buy_price': buy_price,
-                        'sell_price': sell_price,
-                        'fill_time': limiter
-                    })
-                    
-                except (KeyError, IndexError):
-                    continue
-
-            # Sort and display top 10
-            profitable_items.sort(key=itemgetter('hourly_profit'), reverse=True)
-            print("\nTop Profitable Items:")
-            for idx, item in enumerate(profitable_items[:10]):
-                print(f"{idx+1}. {item['item']}")
-                print(f"   Margin: {item['margin']:.2f} | Hourly Profit: {item['hourly_profit']:,.2f}")
-                print(f"   Buy: {item['buy_price']:.2f} | Sell: {item['sell_price']:.2f}")
-                print(f"   Fill Time: {item['fill_time']:.2f}s\n")
+        if not api_data or 'products' not in api_data:
+            time.sleep(1)
+            continue
             
-        time.sleep(300)  # Re-analyze every 5 minutes
+        opportunities = []
+        products = api_data['products']
+        
+        for product_id, product in products.items():
+            try:
+                instant_buy = product['sell_summary'][0]['pricePerUnit'] * 1.0075
+                instant_sell = product['buy_summary'][0]['pricePerUnit'] * 0.9925
+                
+                # Price filter check
+                if instant_buy <= MIN_PRICE:
+                    continue
+                
+                margin = instant_sell - instant_buy
+                margin_pct = (margin / instant_buy) * 100
+                
+                if margin_pct < MIN_MARGIN_PCT:
+                    continue
+                    
+                quantity = min(int(INVESTMENT / instant_buy), 
+                             product['sell_summary'][0]['amount'],
+                             product['buy_summary'][0]['amount'])
+                
+                if quantity < 1:
+                    continue
+                    
+                buy_speed = product['sell_summary'][0]['amount'] / 3600
+                sell_speed = product['buy_summary'][0]['amount'] / 3600
+                cycle_time = (quantity / min(buy_speed, sell_speed)) if min(buy_speed, sell_speed) > 0 else float('inf')
+                
+                if cycle_time > 3600:
+                    continue
+                    
+                hourly_profit = (margin * quantity) * (3600 / cycle_time)
+                
+                opportunities.append({
+                    'item': product_id,
+                    'margin%': margin_pct,
+                    'profit/hr': hourly_profit,
+                    'price': instant_buy,
+                    'qty': quantity,
+                    'liquidity': min(product['sell_summary'][0]['amount'], product['buy_summary'][0]['amount'])
+                })
+                
+            except (KeyError, IndexError):
+                continue
+
+        opportunities.sort(key=lambda x: x['profit/hr'] / x['price'], reverse=True)
+        
+        print(f"\n{' Top 5 Bazaar Opportunities ':=^40}")
+        print(f"Config: >{MIN_PRICE:,} coins/item | >{MIN_MARGIN_PCT}% margin")
+        print(f"Updated: {time.strftime('%H:%M:%S')}\n")
+        
+        for idx, opp in enumerate(opportunities[:5]):
+            print(f"{idx+1}. {opp['item']}")
+            print(f"   Price: {opp['price']:>8,.2f} | Qty: {opp['qty']:>6,}")
+            print(f"   Margin: {opp['margin%']:>5.1f}% | Hourly: {opp['profit/hr']:>12,.0f}")
+            print(f"   Liquidity: {opp['liquidity']:>10,}\n")
+            
+        print("="*40 + "\n")
+        time.sleep(60)
 
 if __name__ == "__main__":
-    threading.Thread(target=update_api, daemon=True).start()
-    threading.Thread(target=analyze_profits, daemon=True).start()
+    threading.Thread(target=fetch_bazaar, daemon=True).start()
+    time.sleep(2)
+    threading.Thread(target=analyze_markets, daemon=True).start()
     
     try:
-        while True:
-            time.sleep(1)
+        while True: time.sleep(1)
     except KeyboardInterrupt:
-        print("\nStopped by user")
+        print("Stopped market tracker")
